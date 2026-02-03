@@ -3,7 +3,7 @@ import sys
 import os
 
 # Add stich_old to path to reuse code
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'stich_old'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 try:
     from runstich import PanoramaStitcher

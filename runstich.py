@@ -36,6 +36,7 @@ class PanoramaStitcher:
             rotation_method: 'slerp' or 'bundle' for rotation computation
         """
         self.device = device if torch.cuda.is_available() else 'cpu'
+        print(f"Using device: {self.device}")
         self.show = show
         self.rotation_method = rotation_method
         self.load_config(config_path)
@@ -414,15 +415,22 @@ class PanoramaStitcher:
         
         # Optimize
         print("Running optimization...")
+        
+        # Callback to track optimization progress
+        iteration_data = {'iter': 0, 'prev_cost': None}
+        
+        
+        
         result = least_squares(
             cost_function, 
             x0, 
             method='trf',  # Trust Region Reflective - better for large problems
-            verbose=2,
+            verbose=2,     # Disable built-in verbose to use our callback
             max_nfev=500,  # Increased iterations
             ftol=1e-6,     # Tighter tolerance on cost function
             xtol=1e-8,     # Tighter tolerance on parameters
-            gtol=1e-8      # Tighter tolerance on gradient
+            gtol=1e-8,     # Tighter tolerance on gradient
+            x_scale='jac',  # Scale variables by Jacobian (better convergence)
         )
         
         print(f"\nOptimization result: {result.message}")
@@ -577,22 +585,12 @@ class PanoramaStitcher:
         Router method to select rotation computation method.
         Delegates to SLERP or Bundle Adjustment based on self.rotation_method.
         """
+        print(f"\n=== Computing All Rotations using '{self.rotation_method}' method ===")
+
         if self.rotation_method == 'bundle':
             return self.compute_rotations_bundle(equirects)
         else:  # Default to 'slerp'
             return self.compute_rotations_slerp(equirects)
-
-    def get_accumulated_rotations(self, rotations):
-        """
-        Legacy function for compatibility.
-        Rotations already come corrected with SLERP from compute_all_rotations.
-        """
-        print("\n--- Using SLERP-Corrected Rotations ---")
-        for i, rot in enumerate(rotations, start=2):
-            print(f"Camera {i} rotation matrix (relative to camera 1):")
-            print(rot)
-            print()
-        return rotations
 
     def rotate_image_spherical(self, img, rotation_matrix, out_width=None):
         import gc
@@ -858,11 +856,25 @@ class PanoramaStitcher:
         """
         h, w = img1.shape[:2]
         
+        # Detect valid content regions (avoid black/empty areas)
+        # A pixel is valid if it has sufficient intensity in either image
+        img1_valid = np.any(img1 > 10, axis=2).astype(float)
+        img2_valid = np.any(img2 > 10, axis=2).astype(float)
+        
+        # Both images should have content for a good seam location
+        both_valid = img1_valid * img2_valid
+        
         # Compute color difference in overlap region
         diff = np.linalg.norm(img1.astype(float) - img2.astype(float), axis=2)
         diff = diff * overlap_region  # Only consider overlap
         
-        # Apply Gaussian blur to smooth the error
+        # PENALIZACIÓN: Añadir un costo MUY alto donde no hay contenido válido
+        # Esto fuerza al seam a pasar solo por zonas con contenido real
+        INVALID_PENALTY = 1e6  # Penalización enorme para zonas sin contenido
+        invalid_cost = (1.0 - both_valid) * INVALID_PENALTY
+        diff = diff + invalid_cost
+        
+        # Apply Gaussian blur to smooth the error (solo en zonas válidas)
         diff_smooth = cv2.GaussianBlur(diff.astype(np.float32), (15, 15), 0)
         
         # Find vertical seam using dynamic programming
@@ -909,7 +921,19 @@ class PanoramaStitcher:
         
         print(f"  Found optimal seam with average cost: {dp[-1, seam[-1]] / h:.2f}")
         
-        return seam_mask
+        # VISUALIZACIÓN: Crear imagen con la costura dibujada
+        # Mezclar las dos imágenes para ver el overlap
+        vis = ((img1.astype(float) * 0.5 + img2.astype(float) * 0.5) * overlap_region[:,:,np.newaxis]).astype(np.uint8)
+        
+        # Dibujar la línea del seam en color brillante
+        for i in range(h):
+            j = seam[i]
+            # Dibujar una línea vertical más gruesa para visibilidad
+            for offset in range(-2, 3):  # 5 pixels de ancho
+                if 0 <= j + offset < w:
+                    vis[i, j + offset] = [0, 255, 0]  # Verde brillante
+        
+        return seam_mask, vis
     
     def draw_flow_arrows(self, img, flow, step=16):
         """Draw optical flow as arrows on the image.
@@ -1079,7 +1103,7 @@ class PanoramaStitcher:
         # - Guarantees 360° coverage for circular camera array
         
         print("\n" + "="*60)
-        print("STAGE 1: ROTATION COMPUTATION WITH SLERP CORRECTION")
+        print("STAGE 1: ROTATION COMPUTATION ")
         print("="*60)
         
         # Load 6 images
@@ -1105,9 +1129,14 @@ class PanoramaStitcher:
                 cv2.imshow("Equirectangular", cv2.resize(eq, (800, 800)))
                 cv2.waitKey(10)
 
-        print("\nComputing rotations with SLERP correction...")
-        rotations = self.compute_all_rotations(equirects)
-        acc_rots = self.get_accumulated_rotations(rotations)
+        print(f"\nComputing rotations using '{self.rotation_method}' method...")
+        acc_rots = self.compute_all_rotations(equirects)
+        
+        # Print rotation matrices for debugging
+        print("\n--- Computed Rotations ---")
+        for i, rot in enumerate(acc_rots, start=2):
+            theta = np.arctan2(rot[0, 2], rot[2, 2])
+            print(f"Camera {i}: rotation angle = {np.degrees(theta):.1f}°")
         
         # Free equirect images to save memory
         import gc
@@ -1332,21 +1361,31 @@ class PanoramaStitcher:
                 map_y = (grid_y + flow_full[:,:,1]).astype(np.float32)
                 warped_target = cv2.remap(target_img, map_x, map_y, interpolation=cv2.INTER_LINEAR)
                 warped_mask = cv2.remap(target_mask.astype(np.float32), map_x, map_y, interpolation=cv2.INTER_LINEAR)
-                
+                # save warped image for debugging
+                cv2.imwrite(f"warped_target_{i}.jpg", warped_target)
                 # Ensure warped_mask is 3D for broadcasting
                 if len(warped_mask.shape) == 2:
                     warped_mask = warped_mask[:,:,np.newaxis]
                 
-                # Find regions where each image exists
-                target_exists = np.any(warped_target > 0, axis=-1, keepdims=True)
-                stitched_exists = np.any(stitched > 0, axis=-1, keepdims=True)
+                # Find regions where each image exists (with threshold to avoid noise)
+                target_exists = np.any(warped_target > 1, axis=-1, keepdims=True)
+                stitched_exists = np.any(stitched > 1, axis=-1, keepdims=True)
+                
+                # Expand overlap region slightly to cover gaps from warping
+                kernel_dilate = np.ones((3, 3), np.uint8)  # Kernel más pequeño
+                
                 overlap = target_exists & stitched_exists
                 only_target = target_exists & (~stitched_exists)
                 
                 # Determine blend weight for overlap region
                 if cfg.USE_SEAM_CARVING and np.any(overlap):
                     print(f"  Finding optimal seam...")
-                    seam_mask = self.find_optimal_seam(stitched, warped_target, overlap.squeeze())
+                    seam_mask, seam_vis = self.find_optimal_seam(stitched, warped_target, overlap.squeeze())
+                    # invert seam_mask to have 0 for stitched, 1 for target
+                    seam_mask = 1.0 - seam_mask
+                    # Guardar visualización de la costura
+                    cv2.imwrite(f"seam_visualization_{i}.jpg", seam_vis)
+                    print(f"  Saved seam visualization to seam_visualization_{i}.jpg")
                     # Convert seam_mask to 3D
                     if len(seam_mask.shape) == 2:
                         seam_mask = seam_mask[:,:,np.newaxis]
@@ -1355,8 +1394,26 @@ class PanoramaStitcher:
                     # Use warped_mask as blend weight (already 3D)
                     blend_weight = warped_mask
                 
+                # Apply feathering to blend weight for smooth transitions
+                # This creates a gradual transition zone instead of hard edges
+                if len(blend_weight.shape) == 3:
+                    blend_weight_2d = blend_weight[:,:,0]
+                else:
+                    blend_weight_2d = blend_weight
+                
+                # Apply Gaussian blur for soft feathering (kernel más moderado)
+                blend_weight_2d = cv2.GaussianBlur(blend_weight_2d.astype(np.float32), (15, 15), 0)
+                
+                # Expand the blend weight to ensure full coverage of transition zone
+                if len(blend_weight.shape) == 3:
+                    blend_weight = blend_weight_2d[:,:,np.newaxis]
+                else:
+                    blend_weight = blend_weight_2d
+                
                 # Clip blend_weight to [0, 1]
                 blend_weight = np.clip(blend_weight, 0, 1)
+                
+                print(f"  Blend weight range: [{blend_weight.min():.3f}, {blend_weight.max():.3f}]")
                 
                 # Apply blending in overlap region
                 if cfg.USE_MULTIBAND_BLENDING and np.any(overlap):
@@ -1366,24 +1423,44 @@ class PanoramaStitcher:
                     if cfg.AUTO_REDUCE_LEVELS and h_full * w_full > cfg.LARGE_IMAGE_THRESHOLD:
                         levels = max(2, levels - 1)
                     
-                    # Blend only in overlap region
+                    # Blend over entire canvas to avoid edge artifacts
                     blended = self.multiband_blend(stitched, warped_target, blend_weight, levels=levels)
+                    # save blended result for debugging
+                    cv2.imwrite(f"blended_multiband_{i}.jpg", blended)
+                    # Create expanded overlap region for smooth transitions (moderado)
                     
                     # Start with stitched
                     result = stitched.copy()
-                    # Copy blended result in overlap region
+                    
+                    # Apply blended result in expanded overlap region
                     np.copyto(result, blended, where=overlap)
+                    # save result for debugging
+                    cv2.imwrite(f"result_multiband_{i}.jpg", result)
                     # Copy target in only_target region
                     np.copyto(result, warped_target, where=only_target)
+                    
                     stitched = result
                     del blended, result
                 else:
-                    # Simple alpha blending in overlap region
+                    # Simple alpha blending with expanded transition zone
                     result = stitched.copy()
                     
-                    # Blend in overlap region: result = (1-alpha)*stitched + alpha*target
-                    blend_region = (1 - blend_weight) * stitched + blend_weight * warped_target
-                    np.copyto(result, blend_region.astype(np.uint8), where=overlap)
+                    # Create expanded blend region to cover transition area (moderado)
+                    kernel_blend = np.ones((7, 7), np.uint8)
+                    overlap_expanded = cv2.dilate(overlap.astype(np.uint8).squeeze(), kernel_blend, iterations=1)
+                    if len(overlap_expanded.shape) == 2:
+                        overlap_expanded = overlap_expanded[:,:,np.newaxis]
+                    overlap_expanded = overlap_expanded.astype(bool)
+                    
+                    # Blend in expanded overlap region: result = (1-alpha)*stitched + alpha*target
+                    # Ensure blend_weight has same number of dimensions
+                    if len(blend_weight.shape) == 2 and stitched.shape[2] == 3:
+                        blend_weight_3d = np.repeat(blend_weight[:,:,np.newaxis], 3, axis=2)
+                    else:
+                        blend_weight_3d = blend_weight
+                    
+                    blend_region = (1 - blend_weight_3d) * stitched + blend_weight_3d * warped_target
+                    np.copyto(result, blend_region.astype(np.uint8), where=overlap_expanded)
                     
                     # Copy target directly where only target exists
                     np.copyto(result, warped_target, where=only_target)
@@ -1422,13 +1499,16 @@ def parse_args():
     parser.add_argument("--input_template", required=True, help="Input filename template with {id} (e.g. ./imgs/origin_{id}.jpg)")
     parser.add_argument("--output", required=True, help="Output filename")
     parser.add_argument("--show", action="store_true", help="Show processing steps")
+    parser.add_argument("--device", default="cpu", help="Device to use for processing (e.g. cpu, cuda)")
+    parser.add_argument("--rotation_method", default="slerp", help="Rotation computation method (slerp or bundle)")
     # Batch mode args could be added
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
     
-    stitcher = PanoramaStitcher(args.config, show=args.show)
+    stitcher = PanoramaStitcher(args.config, show=args.show, 
+                                device=args.device, rotation_method=args.rotation_method)
     
     # 1. Compute Rotations (using input images as calibration source?)
     # Usually we need a set of images to calibrate rotations, then apply to others.

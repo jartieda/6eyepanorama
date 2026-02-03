@@ -1,7 +1,7 @@
 # Copiar lógica de calibración
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'stich_old'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 try:
     from mycalibrate import *
